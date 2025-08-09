@@ -1,0 +1,610 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Image Format Converter — Pro (Browser-only)</title>
+    <meta name="description" content="Convert images in your browser: PNG/JPEG/WebP/AVIF, resize, crop, watermark, enhance, EXIF passthrough." />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='%23000' d='M2 2h12v12H2z'/%3E%3C/svg%3E" />
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script> tailwind.config = { darkMode: 'class' } </script>
+    <style> html, body, #root { height: 100%; } </style>
+  </head>
+  <body class="antialiased">
+    <div id="root"></div>
+
+    <script type="module">
+      import React, { useEffect, useMemo, useRef, useState } from "https://esm.sh/react@18.3.1";
+      import { createRoot } from "https://esm.sh/react-dom@18.3.1/client";
+      import { motion, AnimatePresence } from "https://esm.sh/framer-motion@11.3.30";
+      import {
+        Upload, Download, Image as ImageIcon, Trash2, FlipHorizontal, FlipVertical,
+        Settings2, Sun, Moon, Layers, Type, ImagePlus, Wand2
+      } from "https://esm.sh/lucide-react@0.471.1";
+      import JSZip from "https://esm.sh/jszip@3.10.1";
+      import { saveAs } from "https://esm.sh/file-saver@2.0.5";
+      import Cropper from "https://esm.sh/react-easy-crop@5.0.7";
+      import piexif from "https://esm.sh/piexifjs@1.0.6";
+
+      const SUPPORTED_OUTPUTS = [
+        { label: "PNG", mime: "image/png", id: "png", lossy: false },
+        { label: "JPEG", mime: "image/jpeg", id: "jpeg", lossy: true },
+        { label: "WebP", mime: "image/webp", id: "webp", lossy: true },
+        { label: "AVIF", mime: "image/avif", id: "avif", lossy: true },
+      ];
+
+      const ACCEPTED_INPUTS = [
+        "image/png","image/jpeg","image/webp","image/avif","image/gif","image/bmp","image/svg+xml","image/tiff",
+      ];
+
+      const SOCIAL_PRESETS = [
+        { group: "Instagram", label: "Post 1:1", aspect: 1/1 },
+        { group: "Instagram", label: "Portrait 4:5", aspect: 4/5 },
+        { group: "Instagram", label: "Story/Reel 9:16", aspect: 9/16 },
+        { group: "LinkedIn", label: "Post 1200×627 (~1.91:1)", aspect: 1200/627 },
+        { group: "LinkedIn", label: "Square 1:1", aspect: 1/1 },
+        { group: "iPhone", label: "iPhone 13 wallpaper 1170×2532 (~9:19.5)", aspect: 9/19.5 },
+      ];
+
+      function useColorScheme() {
+        const [dark, setDark] = useState(() => {
+          if (typeof window === "undefined") return true;
+          return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+        });
+        useEffect(() => {
+          const root = document.documentElement;
+          if (dark) root.classList.add("dark"); else root.classList.remove("dark");
+        }, [dark]);
+        return { dark, setDark };
+      }
+      function classNames(...arr) { return arr.filter(Boolean).join(" "); }
+      function hasSolidBg(hex) { return typeof hex === "string" && hex.length >= 7 && hex.length !== 9; }
+      function evalAspect(s){ const map={"1:1":1, "4:3":4/3, "16:9":16/9, "9:16":9/16}; return map[s]??undefined; }
+      function clamp(v){ return Math.max(0, Math.min(255, v|0)); }
+      function placeRect(w, h, cw, ch, pos, m) {
+        let x=0, y=0;
+        switch(pos){
+          case "top-left": x=m; y=m+h; break;
+          case "top-right": x=cw-m-w; y=m+h; break;
+          case "bottom-left": x=m; y=ch-m; break;
+          case "center": x=(cw-w)/2; y=(ch+h)/2; break;
+          default: x=cw-m-w; y=ch-m;
+        }
+        return { x, y };
+      }
+      function unsharpMask(data, w, h, amt){
+        if (amt<=0) return data;
+        const k = amt;
+        const a = new Uint8ClampedArray(data);
+        const idx=(x,y)=> (y*w + x)*4;
+        const out = new Uint8ClampedArray(data.length);
+        for (let y=1;y<h-1;y++){
+          for (let x=1;x<w-1;x++){
+            for (let c=0;c<3;c++){
+              const i = idx(x,y)+c;
+              const v = a[idx(x,y)+c]*(1+4*k)
+                      - a[idx(x-1,y)+c]*k - a[idx(x+1,y)+c]*k
+                      - a[idx(x,y-1)+c]*k - a[idx(x,y+1)+c]*k;
+              out[i]=clamp(v); out[i+1]=a[i+1];
+            }
+            out[idx(x,y)+3]=a[idx(x,y)+3];
+          }
+        }
+        for (let x=0;x<w;x++){ for (let c=0;c<4;c++){ out[idx(x,0)+c]=a[idx(x,0)+c]; out[idx(x,h-1)+c]=a[idx(x,h-1)+c]; } }
+        for (let y=0;y<h;y++){ for (let c=0;c<4;c++){ out[idx(0,y)+c]=a[idx(0,y)+c]; out[idx(w-1,y)+c]=a[idx(w-1,y)+c]; } }
+        return out;
+      }
+      function blobToDataURL(blob){ return new Promise((res)=>{ const r=new FileReader(); r.onload=()=>res(r.result); r.readAsDataURL(blob); }); }
+      function dataURLToBlob(dataURL){ const arr=dataURL.split(','); const mime=arr[0].match(/:(.*?);/)[1]; const bstr=atob(arr[1]); let n=bstr.length; const u8=new Uint8Array(n); while(n--){u8[n]=bstr.charCodeAt(n);} return new Blob([u8], {type:mime}); }
+      function loadHTMLImage(url) { return new Promise((resolve, reject) => { const img = new Image(); img.onload = () => resolve(img); img.onerror = reject; img.crossOrigin = "anonymous"; img.src = url; }); }
+      async function getImageDimensions(url) { const img = await loadHTMLImage(url); return { w: img.naturalWidth, h: img.naturalHeight }; }
+
+      function App(){
+        const { dark, setDark } = useColorScheme();
+        const [files, setFiles] = useState([]);
+        const [targetFormat, setTargetFormat] = useState("webp");
+        const [quality, setQuality] = useState(0.92);
+        const [resizeMode, setResizeMode] = useState("original");
+        const [targetW, setTargetW] = useState(0);
+        const [targetH, setTargetH] = useState(0);
+        const [keepAspect, setKeepAspect] = useState(true);
+        const [bgColor, setBgColor] = useState("#00000000");
+        const [rotateDeg, setRotateDeg] = useState(0);
+        const [flipH, setFlipH] = useState(false);
+        const [flipV, setFlipV] = useState(false);
+        const [prefix, setPrefix] = useState("");
+        const [suffix, setSuffix] = useState("_converted");
+        const [processing, setProcessing] = useState(false);
+        const [avifSupported, setAvifSupported] = useState(true);
+
+        const [cropEnabled, setCropEnabled] = useState(false);
+        const [cropAspect, setCropAspect] = useState("free");
+        const [presetAspect, setPresetAspect] = useState(null);
+        const [cropperOpen, setCropperOpen] = useState(false);
+        const [activeFileId, setActiveFileId] = useState(null);
+        const [cropZoom, setCropZoom] = useState(1);
+        const [cropPos, setCropPos] = useState({ x: 0, y: 0 });
+        const [cropPixels, setCropPixels] = useState(null);
+        const [focalX, setFocalX] = useState(50);
+        const [focalY, setFocalY] = useState(50);
+
+        const [wmText, setWmText] = useState("");
+        const [wmOpacity, setWmOpacity] = useState(0.25);
+        const [wmSize, setWmSize] = useState(24);
+        const [wmPosition, setWmPosition] = useState("bottom-right");
+        const [wmMargin, setWmMargin] = useState(16);
+
+        const [logoUrl, setLogoUrl] = useState(null);
+        const [logoImg, setLogoImg] = useState(null);
+        const [logoOpacity, setLogoOpacity] = useState(0.5);
+        const [logoScale, setLogoScale] = useState(12);
+        const [logoPosition, setLogoPosition] = useState("bottom-right");
+        const [logoMargin, setLogoMargin] = useState(16);
+
+        const [sharpenOn, setSharpenOn] = useState(false);
+        const [sharpenAmt, setSharpenAmt] = useState(0.5);
+        const [enhanceOn, setEnhanceOn] = useState(false);
+        const [contrast, setContrast] = useState(1.08);
+        const [exposure, setExposure] = useState(0);
+        const [metadataPassthrough, setMetadataPassthrough] = useState(true);
+
+        const inputRef = useRef(null);
+        const logoInputRef = useRef(null);
+
+        useEffect(() => {
+          try {
+            const c = document.createElement("canvas");
+            const data = c.toDataURL("image/avif");
+            if (!data || data.indexOf("data:image/avif") !== 0) setAvifSupported(false);
+          } catch {
+            setAvifSupported(false);
+          }
+        }, []);
+
+        const onFilePick = (e) => addFiles(e.target.files || []);
+        const onLogoPick = async (e) => {
+          const f = e.target.files && e.target.files[0];
+          if (!f) return;
+          const url = URL.createObjectURL(f);
+          setLogoUrl(url);
+          const img = await loadHTMLImage(url);
+          setLogoImg(img);
+        };
+
+        const addFiles = async (list) => {
+          const arr = Array.from(list || []);
+          const filtered = arr.filter(f => ["image/"].some(()=>true) and (f.type.startsWith("image/")));
+          const mapped = await Promise.all(filtered.map(async (file) => {
+            const url = URL.createObjectURL(file);
+            const dims = await getImageDimensions(url);
+            return { id: crypto.randomUUID(), file, url, name: file.name, width: dims.w, height: dims.h, focalX: 50, focalY: 50, crop: null };
+          }));
+          setFiles(prev => [...prev, ...mapped]);
+        };
+
+        const removeFile = (id) => setFiles(prev => prev.filter(f => f.id !== id));
+        const clearAll = () => { files.forEach(f => URL.revokeObjectURL(f.url)); setFiles([]); };
+        const onDrop = (e) => { e.preventDefault(); e.stopPropagation(); const dt = e.dataTransfer; if (dt?.files?.length) addFiles(dt.files); };
+
+        const dragIndex = useRef(null);
+        const onDragStart = (i) => () => { dragIndex.current = i; };
+        const onDragOverItem = () => (e) => { e.preventDefault(); };
+        const onDropItem = (i) => (e) => {
+          e.preventDefault();
+          const from = dragIndex.current;
+          if (from === null || from === i) return;
+          setFiles(prev => { const a = prev.slice(); const [m] = a.splice(from,1); a.splice(i,0,m); return a; });
+          dragIndex.current = null;
+        };
+
+        const getTargetMime = () => {
+          if (targetFormat === "avif" && !avifSupported) return "image/webp";
+          const item = SUPPORTED_OUTPUTS.find(x => x.id === targetFormat);
+          return item?.mime || "image/png";
+        };
+        const needsOpaqueBg = React.useMemo(() => getTargetMime() === "image/jpeg", [targetFormat, avifSupported]);
+
+        const openCropper = (fileId) => {
+          setActiveFileId(fileId);
+          setCropperOpen(true);
+          const f = files.find(x => x.id === fileId);
+          if (f?.crop) setCropPixels(f.crop);
+          setCropZoom(1);
+          setCropPos({ x: 0, y: 0 });
+        };
+        const onCropComplete = (_area, areaPixels) => { setCropPixels(areaPixels); };
+        const saveCropForActive = () => {
+          if (!activeFileId || !cropPixels) { setCropperOpen(false); return; }
+          setFiles(prev => prev.map(it => it.id === activeFileId ? { ...it, crop: cropPixels } : it));
+          setCropperOpen(false);
+        };
+        const updateFocal = (id, k, v) => setFiles(prev => prev.map(it => it.id === id ? { ...it, [k]: v } : it));
+
+        const convertOne = async (f) => {
+          const img = await loadHTMLImage(f.url);
+          let sx = 0, sy = 0, sw = img.naturalWidth, sh = img.naturalHeight;
+
+          const useManualCrop = !!f.crop;
+          if (useManualCrop) {
+            sx = f.crop.x; sy = f.crop.y; sw = f.crop.width; sh = f.crop.height;
+          } else if (cropEnabled) {
+            const aspectMap = { "1:1": 1, "4:3": 4/3, "16:9": 16/9, "9:16": 9/16 };
+            const effectiveAspect = presetAspect || (cropAspect === "free" ? (sw / sh) : (aspectMap[cropAspect] || sw/sh));
+            const fx = (f.focalX ?? 50) / 100; const fy = (f.focalY ?? 50) / 100;
+            if (sw / sh > effectiveAspect) { sh = img.naturalHeight; sw = Math.round(sh * effectiveAspect); }
+            else { sw = img.naturalWidth; sh = Math.round(sw / effectiveAspect); }
+            sx = Math.round(fx * img.naturalWidth - sw/2); sy = Math.round(fy * img.naturalHeight - sh/2);
+            sx = Math.max(0, Math.min(img.naturalWidth - sw, sx)); sy = Math.max(0, Math.min(img.naturalHeight - sh, sy));
+          }
+
+          let tw = sw, th = sh;
+          if (resizeMode === "pixels" && targetW > 0 && targetH > 0) {
+            if (keepAspect) {
+              const ratio = sw / sh;
+              if (targetW / targetH > ratio) { th = targetH; tw = Math.round(th * ratio); }
+              else { tw = targetW; th = Math.round(tw / ratio); }
+            } else { tw = targetW; th = targetH; }
+          } else if (resizeMode === "percent") {
+            const p = Math.max(1, Math.min(1000, Number(targetW || 100)));
+            tw = Math.max(1, Math.round(sw * (p/100))); th = Math.max(1, Math.round(sh * (p/100)));
+          }
+
+          const base = document.createElement("canvas");
+          base.width = tw; base.height = th;
+          const bctx = base.getContext("2d");
+          if (needsOpaqueBg || hasSolidBg(bgColor)) { bctx.fillStyle = needsOpaqueBg ? (bgColor?.slice(0,7) || "#000000") : bgColor; bctx.fillRect(0,0,tw,th); }
+          bctx.drawImage(img, sx, sy, sw, sh, 0, 0, tw, th);
+
+          const rad = (rotateDeg % 360) * Math.PI/180; const cos = Math.abs(Math.cos(rad)); const sin = Math.abs(Math.sin(rad));
+          const rotW = Math.round(tw * cos + th * sin); const rotH = Math.round(tw * sin + th * cos);
+          const canvas = document.createElement("canvas"); canvas.width = rotW; canvas.height = rotH;
+          const ctx = canvas.getContext("2d");
+          if (needsOpaqueBg || hasSolidBg(bgColor)) { ctx.fillStyle = needsOpaqueBg ? (bgColor?.slice(0,7) || "#000000") : bgColor; ctx.fillRect(0,0,rotW,rotH); }
+          ctx.translate(rotW/2, rotH/2); ctx.rotate(rad); ctx.scale(flipH ? -1 : 1, flipV ? -1 : 1);
+          ctx.drawImage(base, -tw/2, -th/2);
+
+          if (enhanceOn || sharpenOn) {
+            const imgData = ctx.getImageData(0,0,canvas.width, canvas.height);
+            let data = imgData.data;
+            if (enhanceOn) {
+              const c = Math.max(0.1, Math.min(3, contrast));
+              const e = Math.max(-255, Math.min(255, Math.round(exposure*2.55)));
+              for (let i=0; i<data.length; i+=4) {
+                data[i] = clamp(((data[i]-128)*c)+128 + e);
+                data[i+1] = clamp(((data[i+1]-128)*c)+128 + e);
+                data[i+2] = clamp(((data[i+2]-128)*c)+128 + e);
+              }
+            }
+            if (sharpenOn) {
+              data = unsharpMask(data, canvas.width, canvas.height, sharpenAmt);
+              imgData.data.set(data);
+            }
+            ctx.putImageData(imgData, 0, 0);
+          }
+
+          if (wmText && wmText.trim().length > 0) {
+            ctx.setTransform(1,0,0,1,0,0);
+            ctx.globalAlpha = Math.max(0, Math.min(1, wmOpacity));
+            ctx.fillStyle = "white"; ctx.strokeStyle = "black"; ctx.lineWidth = Math.max(1, Math.round(wmSize/10));
+            ctx.font = `${wmSize}px sans-serif`;
+            const metrics = ctx.measureText(wmText); const w = metrics.width; const h = wmSize; const m = wmMargin;
+            const { x, y } = placeRect(w, h, canvas.width, canvas.height, wmPosition, m);
+            ctx.strokeText(wmText, x, y); ctx.fillText(wmText, x, y); ctx.globalAlpha = 1;
+          }
+          if (logoImg) {
+            ctx.setTransform(1,0,0,1,0,0);
+            ctx.globalAlpha = Math.max(0, Math.min(1, logoOpacity));
+            const targetWidth = Math.round(canvas.width * (logoScale/100));
+            const ratio = logoImg.naturalWidth / logoImg.naturalHeight;
+            const w = targetWidth; const h = Math.round(w / ratio); const m = logoMargin;
+            const pos = placeRect(w, h, canvas.width, canvas.height, logoPosition, m);
+            ctx.drawImage(logoImg, pos.x, pos.y - h, w, h);
+            ctx.globalAlpha = 1;
+          }
+
+          const mime = getTargetMime();
+          const q = Math.max(0, Math.min(1, quality));
+          let blob = await new Promise((resolve) => canvas.toBlob(resolve, mime, q));
+
+          if (metadataPassthrough && mime === "image/jpeg" && f.file.type === "image/jpeg") {
+            try {
+              const originalDataUrl = await blobToDataURL(f.file);
+              const newDataUrl = await blobToDataURL(blob);
+              const exif = piexif.load(originalDataUrl);
+              if (exif["0th"]) exif["0th"][piexif.ImageIFD.Orientation] = 1;
+              const exifBytes = piexif.dump(exif);
+              const inserted = piexif.insert(exifBytes, newDataUrl);
+              blob = dataURLToBlob(inserted);
+            } catch (e) { console.warn("EXIF passthrough failed:", e); }
+          }
+
+          const ext = mime.split("/")[1] || targetFormat;
+          const baseName = f.name.replace(/\.[^.]+$/, "");
+          const outName = `${prefix}${baseName}${suffix}.${ext}`;
+          return { blob, name: outName };
+        };
+
+        const handleConvertSelected = async () => {
+          if (!files.length) return;
+          setProcessing(true);
+          try {
+            const zip = new JSZip();
+            for (const f of files) {
+              const { blob, name } = await convertOne(f);
+              if (blob) zip.file(name, blob);
+            }
+            const zipBlob = await zip.generateAsync({ type: "blob" });
+            saveAs(zipBlob, `converted_${Date.now()}.zip`);
+          } finally { setProcessing(false); }
+        };
+        const handleConvertSingle = async (f) => {
+          setProcessing(true);
+          try { const { blob, name } = await convertOne(f); if (blob) saveAs(blob, name); }
+          finally { setProcessing(false); }
+        };
+
+        return (
+          React.createElement("div", {className:"min-h-screen bg-gradient-to-b from-slate-50 to-slate-100 dark:from-slate-900 dark:to-slate-950 text-slate-900 dark:text-slate-100"},
+            React.createElement("header", {className:"sticky top-0 z-20 backdrop-blur border-b border-slate-200/60 dark:border-slate-800/60 bg-white/70 dark:bg-slate-900/60"},
+              React.createElement("div", {className:"max-w-6xl mx-auto px-4 py-3 flex items-center justify-between"},
+                React.createElement("div", {className:"flex items-center gap-2"},
+                  React.createElement(Layers, {className:"w-6 h-6"}),
+                  React.createElement("h1", {className:"text-lg font-semibold tracking-tight"},"Image Format Converter — Pro"),
+                  React.createElement("span", {className:"ml-2 text-xs px-2 py-0.5 rounded-full bg-slate-200 dark:bg-slate-800"},"Browser-only")
+                ),
+                React.createElement("div", {className:"flex items-center gap-2"},
+                  React.createElement("button", {onClick:()=>setDark(!dark), className:"rounded-xl border border-slate-300 dark:border-slate-700 px-3 py-1.5 hover:bg-slate-100 dark:hover:bg-slate-800 transition", "aria-label":"Toggle theme"}, dark ? React.createElement(Sun, {className:"w-4 h-4"}) : React.createElement(Moon, {className:"w-4 h-4"})),
+                  React.createElement("a", {href:"#", onClick:(e)=>{e.preventDefault(); handleConvertSelected();}, className: "inline-flex items-center gap-2 rounded-xl px-3 py-2 border text-sm font-medium bg-slate-900 text-white border-slate-900 hover:bg-slate-800 disabled:opacity-50 dark:bg-white dark:text-slate-900 dark:border-white dark:hover:bg-slate-100"}, React.createElement(Download, {className:"w-4 h-4"}), " Convert All (ZIP)")
+                )
+              )
+            ),
+            React.createElement("main", {className:"max-w-6xl mx-auto px-4 py-6"},
+              React.createElement("section", {onDrop:(e)=>{e.preventDefault(); e.stopPropagation(); const dt=e.dataTransfer; if (dt?.files?.length) addFiles(dt.files);}, onDragOver:(e)=>{e.preventDefault(); e.stopPropagation();}, className:"border-2 border-dashed rounded-3xl p-8 text-center bg-white/70 dark:bg-slate-900/50 border-slate-300 dark:border-slate-700"},
+                React.createElement("div", {className:"flex flex-col items-center gap-3"},
+                  React.createElement(Upload, {className:"w-10 h-10"}),
+                  React.createElement("p", {className:"text-sm opacity-80"},"Drag & drop images here, or"),
+                  React.createElement("div", {className:"flex flex-wrap gap-2"},
+                    React.createElement("button", {onClick:()=>inputRef.current?.click(), className:"inline-flex items-center gap-2 rounded-xl px-4 py-2 border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800"}, React.createElement(ImageIcon, {className:"w-4 h-4"}), " Choose Images"),
+                    React.createElement("button", {onClick:()=>logoInputRef.current?.click(), className:"inline-flex items-center gap-2 rounded-xl px-4 py-2 border border-emerald-300 dark:border-emerald-700 hover:bg-emerald-50 dark:hover:bg-emerald-900/30"}, React.createElement(ImagePlus, {className:"w-4 h-4"}), " Upload Logo")
+                  ),
+                  React.createElement("input", {ref:inputRef, type:"file", multiple:true, accept:ACCEPTED_INPUTS.join(","), className:"hidden", onChange:(e)=>onFilePick(e)}),
+                  React.createElement("input", {ref:logoInputRef, type:"file", accept:ACCEPTED_INPUTS.join(","), className:"hidden", onChange:(e)=>onLogoPick(e)}),
+                  React.createElement("p", {className:"text-xs opacity-70"},"Supported: PNG, JPG, WebP, AVIF, GIF, BMP, SVG, TIFF")
+                )
+              ),
+              React.createElement("section", {className:"mt-8 grid grid-cols-1 lg:grid-cols-2 gap-6"},
+                React.createElement("div", {className:"rounded-3xl p-6 border bg-white/70 dark:bg-slate-900/50 border-slate-200 dark:border-slate-800"},
+                  React.createElement("div", {className:"flex items-center gap-2 mb-4"}, React.createElement(Settings2, {className:"w-5 h-5"}), React.createElement("h2", {className:"font-semibold"},"Output Settings")),
+                  React.createElement("div", {className:"grid grid-cols-1 md:grid-cols-2 gap-4"},
+                    React.createElement("div", null, React.createElement("label", {className:"text-sm"},"Format"),
+                      React.createElement("select", {className:"mt-1 w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-2", value:targetFormat, onChange:(e)=>setTargetFormat(e.target.value)}, SUPPORTED_OUTPUTS.map(o=> React.createElement("option", {key:o.id, value:o.id}, o.label, (o.id==="avif"&&!avifSupported)?" (fallback to WebP)":"") ))),
+                    React.createElement("div", null, React.createElement("label", {className:"text-sm"},"Quality ", React.createElement("span",{className:"opacity-70"},"(", Math.round(quality*100), "%)")),
+                      React.createElement("input", {type:"range", min:0.1, max:1, step:0.01, value:quality, onChange:(e)=>setQuality(parseFloat(e.target.value)), className:"mt-2 w-full"}),
+                      React.createElement("p",{className:"text-xs opacity-70 mt-1"},"Lossy formats only.")
+                    ),
+                    React.createElement("div", null, React.createElement("label",{className:"text-sm"},"Resize"),
+                      React.createElement("select",{className:"mt-1 w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-2", value:resizeMode, onChange:(e)=>setResizeMode(e.target.value)},
+                        React.createElement("option",{value:"original"},"Keep original"),
+                        React.createElement("option",{value:"pixels"},"Set width × height (px)"),
+                        React.createElement("option",{value:"percent"},"Scale by percentage")
+                      )
+                    ),
+                    resizeMode==="pixels" && React.createElement("div",{className:"grid grid-cols-2 gap-3"},
+                      React.createElement("div", null, React.createElement("label",{className:"text-sm"},"Width (px)"),
+                        React.createElement("input",{type:"number", min:1, className:"mt-1 w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-2", value:targetW, onChange:(e)=>setTargetW(parseInt(e.target.value||"0"))})
+                      ),
+                      React.createElement("div", null, React.createElement("label",{className:"text-sm"},"Height (px)"),
+                        React.createElement("input",{type:"number", min:1, className:"mt-1 w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-2", value:targetH, onChange:(e)=>setTargetH(parseInt(e.target.value||"0"))})
+                      ),
+                      React.createElement("label",{className:"col-span-2 inline-flex items-center gap-2 text-sm mt-1"},
+                        React.createElement("input",{type:"checkbox", checked:keepAspect, onChange:(e)=>setKeepAspect(e.target.checked)}),"Keep aspect ratio"
+                      )
+                    ),
+                    resizeMode==="percent" && React.createElement("div", null, React.createElement("label",{className:"text-sm"},"Scale (%)"),
+                      React.createElement("input",{type:"number", min:1, max:1000, className:"mt-1 w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-2", value:targetW, onChange:(e)=>setTargetW(parseInt(e.target.value||"100"))})
+                    ),
+                    React.createElement("div", null, React.createElement("label",{className:"text-sm"},"Background (for JPEG / opaque)"),
+                      React.createElement("input",{type:"color", value:bgColor, onChange:(e)=>setBgColor(e.target.value), className:"mt-1 w-full h-10 rounded-xl border border-slate-300 dark:border-slate-700"}),
+                      React.createElement("p",{className:"text-xs opacity-70 mt-1"},"Used when output has no alpha")
+                    ),
+                    React.createElement("div",{className:"grid grid-cols-3 gap-3"},
+                      React.createElement("div", null, React.createElement("label",{className:"text-sm"},"Rotate (°)"),
+                        React.createElement("input",{type:"number", className:"mt-1 w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-2", value:rotateDeg, onChange:(e)=>setRotateDeg(parseInt(e.target.value||"0"))})
+                      ),
+                      React.createElement("div",{className:"flex items-end"},
+                        React.createElement("button",{onClick:()=>setFlipH(!flipH), className:"w-full mt-6 rounded-xl border px-3 py-2 hover:bg-slate-100 dark:hover:bg-slate-800 border-slate-300 dark:border-slate-700"}, React.createElement(FlipHorizontal,{className:"w-4 h-4 inline"})," Flip H")
+                      ),
+                      React.createElement("div",{className:"flex items-end"},
+                        React.createElement("button",{onClick:()=>setFlipV(!flipV), className:"w-full mt-6 rounded-xl border px-3 py-2 hover:bg-slate-100 dark:hover:bg-slate-800 border-slate-300 dark:border-slate-700"}, React.createElement(FlipVertical,{className:"w-4 h-4 inline"})," Flip V")
+                      )
+                    ),
+                    React.createElement("div",{className:"md:col-span-2 border-t border-slate-200 dark:border-slate-800 pt-4 mt-2"},
+                      React.createElement("div",{className:"flex flex-wrap items-center gap-3"},
+                        React.createElement("label",{className:"inline-flex items-center gap-2 text-sm"},
+                          React.createElement("input",{type:"checkbox", checked:cropEnabled, onChange:(e)=>setCropEnabled(e.target.checked)}),"Enable crop"
+                        ),
+                        React.createElement("select",{className:"rounded-xl border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-2 text-sm", value:cropAspect, onChange:(e)=>{setCropAspect(e.target.value); setPresetAspect(null);}},
+                          React.createElement("option",{value:"free"},"Free"),
+                          React.createElement("option",{value:"1:1"},"1:1"),
+                          React.createElement("option",{value:"4:3"},"4:3"),
+                          React.createElement("option",{value:"16:9"},"16:9"),
+                          React.createElement("option",{value:"9:16"},"9:16"),
+                        ),
+                        React.createElement("select",{className:"rounded-xl border border-amber-300 dark:border-amber-700 bg-transparent px-3 py-2 text-sm", onChange:(e)=>{const v=e.target.value; setPresetAspect(v?Number(v):null); setCropAspect("free");}, defaultValue:""},
+                          React.createElement("option",{value:""},"Social presets…"),
+                          ...SOCIAL_PRESETS.map((p,i)=> React.createElement("option",{key:i, value:p.aspect}, `${p.group} — ${p.label}`))
+                        )
+                      ),
+                      cropEnabled && React.createElement("div",{className:"mt-3 grid grid-cols-1 md:grid-cols-3 gap-3"},
+                        React.createElement("div", null, React.createElement("label",{className:"text-sm"},"Focal X (",focalX,"%)"),
+                          React.createElement("input",{type:"range", min:0, max:100, value:focalX, onChange:(e)=>setFocalX(parseInt(e.target.value)), className:"mt-2 w-full"})
+                        ),
+                        React.createElement("div", null, React.createElement("label",{className:"text-sm"},"Focal Y (",focalY,"%)"),
+                          React.createElement("input",{type:"range", min:0, max:100, value:focalY, onChange:(e)=>setFocalY(parseInt(e.target.value)), className:"mt-2 w-full"})
+                        ),
+                        React.createElement("div",{className:"flex items-end"},
+                          React.createElement("button",{onClick:()=>{ if(files.length){ setActiveFileId(files[0].id); setCropperOpen(true);} }, className:"w-full rounded-xl border px-3 py-2 border-amber-300 dark:border-amber-700 hover:bg-amber-50 dark:hover:bg-amber-900/30"},"Open manual crop editor…")
+                        )
+                      )
+                    ),
+                    React.createElement("div",{className:"md:col-span-2 border-t border-slate-200 dark:border-slate-800 pt-4 mt-2"},
+                      React.createElement("h3",{className:"font-medium mb-2"},"Watermark"),
+                      React.createElement("div",{className:"grid grid-cols-1 md:grid-cols-5 gap-3"},
+                        React.createElement("div",{className:"md:col-span-2"}, React.createElement("label",{className:"text-sm flex items-center gap-2"}, React.createElement(Type,{className:"w-4 h-4"}),"Text"),
+                          React.createElement("input",{type:"text", className:"mt-1 w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-2", placeholder:"© Your Brand", value:wmText, onChange:(e)=>setWmText(e.target.value)})
+                        ),
+                        React.createElement("div", null, React.createElement("label",{className:"text-sm"},"Opacity (",Math.round(wmOpacity*100),"%)"),
+                          React.createElement("input",{type:"range", min:0, max:1, step:0.01, value:wmOpacity, onChange:(e)=>setWmOpacity(parseFloat(e.target.value)), className:"mt-2 w-full"})
+                        ),
+                        React.createElement("div", null, React.createElement("label",{className:"text-sm"},"Font size"),
+                          React.createElement("input",{type:"number", min:6, max:200, className:"mt-1 w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-2", value:wmSize, onChange:(e)=>setWmSize(parseInt(e.target.value||"24"))})
+                        ),
+                        React.createElement("div", null, React.createElement("label",{className:"text-sm"},"Position"),
+                          React.createElement("select",{className:"mt-1 w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-2", value:wmPosition, onChange:(e)=>setWmPosition(e.target.value)},
+                            React.createElement("option",{value:"bottom-right"},"Bottom right"),
+                            React.createElement("option",{value:"bottom-left"},"Bottom left"),
+                            React.createElement("option",{value:"top-right"},"Top right"),
+                            React.createElement("option",{value:"top-left"},"Top left"),
+                            React.createElement("option",{value:"center"},"Center")
+                          )
+                        ),
+                        React.createElement("div", null, React.createElement("label",{className:"text-sm"},"Margin (px)"),
+                          React.createElement("input",{type:"number", min:0, max:200, className:"mt-1 w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-2", value:wmMargin, onChange:(e)=>setWmMargin(parseInt(e.target.value||"16"))})
+                        )
+                      ),
+                      React.createElement("div",{className:"mt-3 grid grid-cols-1 md:grid-cols-5 gap-3"},
+                        React.createElement("div",{className:"md:col-span-2"}, React.createElement("label",{className:"text-sm flex items-center gap-2"}, React.createElement(ImagePlus,{className:"w-4 h-4"}),"Logo"),
+                          React.createElement("div",{className:"flex items-center gap-2"},
+                            React.createElement("button",{onClick:()=>logoInputRef.current?.click(), className:"rounded-xl border px-3 py-2 border-emerald-300 dark:border-emerald-700 hover:bg-emerald-50 dark:hover:bg-emerald-900/30"},"Choose logo"),
+                            logoUrl && React.createElement("span",{className:"text-xs opacity-70 truncate max-w-[160px]"}, logoUrl.split("/").slice(-1)[0])
+                          )
+                        ),
+                        React.createElement("div", null, React.createElement("label",{className:"text-sm"},"Logo opacity (",Math.round(logoOpacity*100),"%)"),
+                          React.createElement("input",{type:"range", min:0, max:1, step:0.01, value:logoOpacity, onChange:(e)=>setLogoOpacity(parseFloat(e.target.value)), className:"mt-2 w-full"})
+                        ),
+                        React.createElement("div", null, React.createElement("label",{className:"text-sm"},"Logo width (% of image)"),
+                          React.createElement("input",{type:"range", min:4, max:40, step:1, value:logoScale, onChange:(e)=>setLogoScale(parseInt(e.target.value)), className:"mt-2 w-full"})
+                        ),
+                        React.createElement("div", null, React.createElement("label",{className:"text-sm"},"Logo position"),
+                          React.createElement("select",{className:"mt-1 w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-2", value:logoPosition, onChange:(e)=>setLogoPosition(e.target.value)},
+                            React.createElement("option",{value:"bottom-right"},"Bottom right"),
+                            React.createElement("option",{value:"bottom-left"},"Bottom left"),
+                            React.createElement("option",{value:"top-right"},"Top right"),
+                            React.createElement("option",{value:"top-left"},"Top left"),
+                            React.createElement("option",{value:"center"},"Center")
+                          )
+                        ),
+                        React.createElement("div", null, React.createElement("label",{className:"text-sm"},"Logo margin (px)"),
+                          React.createElement("input",{type:"number", min:0, max:200, className:"mt-1 w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-2", value:logoMargin, onChange:(e)=>setLogoMargin(parseInt(e.target.value||"16"))})
+                        )
+                      )
+                    ),
+                    React.createElement("div",{className:"md:col-span-2 border-t border-slate-200 dark:border-slate-800 pt-4 mt-2"},
+                      React.createElement("h3",{className:"font-medium mb-2 flex items-center gap-2"}, React.createElement(Wand2,{className:"w-4 h-4"}),"Enhance"),
+                      React.createElement("div",{className:"grid grid-cols-1 md:grid-cols-3 gap-3"},
+                        React.createElement("label",{className:"inline-flex items-center gap-2 text-sm"},
+                          React.createElement("input",{type:"checkbox", checked:enhanceOn, onChange:(e)=>setEnhanceOn(e.target.checked)})," Auto-enhance"
+                        ),
+                        React.createElement("div", null, React.createElement("label",{className:"text-sm"},"Contrast ×", contrast.toFixed(2)),
+                          React.createElement("input",{type:"range", min:0.5, max:2.5, step:0.01, value:contrast, onChange:(e)=>setContrast(parseFloat(e.target.value)), className:"mt-2 w-full"})
+                        ),
+                        React.createElement("div", null, React.createElement("label",{className:"text-sm"},"Exposure (",exposure,")"),
+                          React.createElement("input",{type:"range", min:-50, max:50, step:1, value:exposure, onChange:(e)=>setExposure(parseInt(e.target.value)), className:"mt-2 w-full"})
+                        ),
+                        React.createElement("label",{className:"inline-flex items-center gap-2 text-sm"},
+                          React.createElement("input",{type:"checkbox", checked:sharpenOn, onChange:(e)=>setSharpenOn(e.target.checked)})," Sharpen"
+                        ),
+                        React.createElement("div", null, React.createElement("label",{className:"text-sm"},"Sharpen amount"),
+                          React.createElement("input",{type:"range", min:0, max:1, step:0.01, value:sharpenAmt, onChange:(e)=>setSharpenAmt(parseFloat(e.target.value)), className:"mt-2 w-full"})
+                        )
+                      )
+                    ),
+                    React.createElement("div",{className:"md:col-span-2 border-t border-slate-200 dark:border-slate-800 pt-4 mt-2"},
+                      React.createElement("label",{className:"inline-flex items-center gap-2 text-sm"},
+                        React.createElement("input",{type:"checkbox", checked:metadataPassthrough, onChange:(e)=>setMetadataPassthrough(e.target.checked)})," Best-effort metadata passthrough for JPEG (EXIF)"
+                      )
+                    ),
+                    React.createElement("div",{className:"md:col-span-2 flex items-center gap-3 mt-2"},
+                      React.createElement("button",{onClick:handleConvertSelected, disabled:!files.length || processing, className:"inline-flex items-center gap-2 rounded-xl px-4 py-2 border bg-slate-900 text-white border-slate-900 hover:bg-slate-800 disabled:opacity-50 dark:bg-white dark:text-slate-900 dark:border-white dark:hover:bg-slate-100"}, React.createElement(Download,{className:"w-4 h-4"}), " Convert All (ZIP)"),
+                      React.createElement("button",{onClick:clearAll, disabled:!files.length, className:"inline-flex items-center gap-2 rounded-xl px-4 py-2 border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800"}, React.createElement(Trash2,{className:"w-4 h-4"}), " Clear"),
+                      React.createElement("p",{className:"text-xs opacity-70"},"Everything runs locally in your browser. Animated GIF/SVG are rasterized.")
+                    )
+                  )
+                ),
+                React.createElement("div",{className:"rounded-3xl p-6 border bg-white/70 dark:bg-slate-900/50 border-slate-200 dark:border-slate-800"},
+                  React.createElement("div",{className:"flex items-center gap-2 mb-4"}, React.createElement(ImageIcon,{className:"w-5 h-5"}), React.createElement("h2",{className:"font-semibold"},"Queue (", files.length, ")")),
+                  files.length===0 ? React.createElement("p",{className:"text-sm opacity-70"},"No images yet. Add some above.") : (
+                    React.createElement("ul",{className:"grid grid-cols-1 md:grid-cols-2 gap-4"},
+                      ...files.map((f, idx) =>
+                        React.createElement("li",{key:f.id, draggable:true, onDragStart:onDragStart(idx), onDragOver:onDragOverItem(), onDrop:onDropItem(idx), className:"rounded-2xl overflow-hidden border border-slate-200 dark:border-slate-800 bg-white/60 dark:bg-slate-900/40"},
+                          React.createElement("div",{className:"aspect-video bg-slate-100 dark:bg-slate-800 overflow-hidden relative"},
+                            React.createElement("img",{src:f.url, alt:f.name, className:"w-full h-full object-contain"}),
+                            cropEnabled && React.createElement("div",{className:"absolute bottom-2 left-2 right-2 text-[11px] bg-black/40 text-white px-2 py-1 rounded-lg backdrop-blur flex items-center gap-2"},
+                              React.createElement("span",null,"Focal:"),
+                              React.createElement("input",{type:"range", min:0, max:100, value:f.focalX, onChange:(e)=>updateFocal(f.id,'focalX',parseInt(e.target.value))}),
+                              React.createElement("input",{type:"range", min:0, max:100, value:f.focalY, onChange:(e)=>updateFocal(f.id,'focalY',parseInt(e.target.value))}),
+                              React.createElement("button",{onClick:()=>{ setActiveFileId(f.id); setCropperOpen(true); }, className:"ml-auto rounded-lg border px-2 py-1 border-amber-300 dark:border-amber-700"},"Manual crop…")
+                            )
+                          ),
+                          React.createElement("div",{className:"p-3 text-sm"},
+                            React.createElement("div",{className:"flex items-center justify-between gap-2"},
+                              React.createElement("span",{className:"truncate font-medium", title:f.name}, idx+1, ". ", f.name),
+                              React.createElement("div",{className:"flex items-center gap-2"},
+                                React.createElement("button",{className:"rounded-lg px-2 py-1 border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800", onClick:()=>removeFile(f.id), "aria-label":`Remove ${f.name}`}, React.createElement(Trash2,{className:"w-4 h-4"})),
+                                React.createElement("button",{onClick:()=>handleConvertSingle(f), disabled:processing, className:"rounded-lg px-2 py-1 border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800"}, React.createElement(Download,{className:"w-4 h-4"}), " Convert")
+                              )
+                            ),
+                            React.createElement("div",{className:"mt-1 opacity-70"}, f.width, " × ", f.height, "px ", f.crop && React.createElement("span",{className:"ml-2"},"• manual crop set"))
+                          )
+                        )
+                      )
+                    )
+                  )
+                )
+              ),
+              React.createElement("section",{className:"mt-8 text-xs opacity-70"},
+                React.createElement("p",null,"New extras: manual crop editor, social crop presets, logo watermark, sharpen & auto-enhance, and EXIF passthrough for JPEG (best effort).")
+              )
+            ),
+            React.createElement(AnimatePresence, null,
+              cropperOpen && React.createElement(motion.div,{initial:{opacity:0}, animate:{opacity:1}, exit:{opacity:0}, className:"fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4"},
+                React.createElement(motion.div,{initial:{scale:0.95, opacity:0}, animate:{scale:1, opacity:1}, exit:{scale:0.95, opacity:0}, className:"w-full max-w-3xl rounded-2xl overflow-hidden bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800"},
+                  React.createElement("div",{className:"p-4 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between"},
+                    React.createElement("h3",{className:"font-semibold"},"Manual Crop"),
+                    React.createElement("button",{onClick:()=>setCropperOpen(false), className:"rounded-lg px-2 py-1 border border-slate-300 dark:border-slate-700"},"Close")
+                  ),
+                  React.createElement("div",{className:"relative w-full h-[60vh] bg-slate-100 dark:bg-slate-800"},
+                    activeFileId && React.createElement(Cropper,{
+                      image: (files.find(x=>x.id===activeFileId)||{}).url,
+                      crop: cropPos,
+                      zoom: cropZoom,
+                      aspect: presetAspect || (cropAspect==="free" ? undefined : evalAspect(cropAspect)),
+                      onCropChange: setCropPos,
+                      onZoomChange: setCropZoom,
+                      onCropComplete: (_a, p) => setCropPixels(p),
+                      showGrid: true
+                    })
+                  ),
+                  React.createElement("div",{className:"p-4 flex items-center gap-3 justify-between"},
+                    React.createElement("div",{className:"flex items-center gap-3"},
+                      React.createElement("label",{className:"text-sm"},"Zoom"),
+                      React.createElement("input",{type:"range", min:1, max:5, step:0.01, value:cropZoom, onChange:(e)=>setCropZoom(parseFloat(e.target.value))})
+                    ),
+                    React.createElement("div",{className:"flex items-center gap-2"},
+                      React.createElement("button",{onClick:()=>setCropPixels(null), className:"rounded-xl border px-3 py-2"},"Reset"),
+                      React.createElement("button",{onClick:()=>{ if (!activeFileId || !cropPixels){ setCropperOpen(false); return;} setFiles(prev => prev.map(it => it.id === activeFileId ? { ...it, crop: cropPixels } : it)); setCropperOpen(false); }, className:"rounded-xl border px-3 py-2 bg-slate-900 text-white dark:bg-white dark:text-slate-900"},"Save crop")
+                    )
+                  )
+                )
+              )
+            ),
+            React.createElement("footer",{className:"max-w-6xl mx-auto px-4 pb-10 pt-6 text-xs opacity-70"},"Built for you — modern, fast, and private (everything stays on-device).")
+          )
+        );
+      }
+
+      const rootEl = document.getElementById("root");
+      createRoot(rootEl).render(React.createElement(App));
+    </script>
+  </body>
+</html>
