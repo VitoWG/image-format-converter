@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Image Format Converter — Pro (Offline)</title>
+    <meta name="description" content="Offline image format converter: PNG/JPEG/WebP/AVIF, resize, crop, watermark, enhance, ZIP export. Runs 100% locally." />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='%23000' d='M2 2h12v12H2z'/%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <div class="logo"></div>
+        <h1>Image Format Converter — Pro</h1>
+        <span class="badge">Offline</span>
+      </div>
+      <div class="actions">
+        <button id="toggleTheme" title="Toggle theme">🌓</button>
+        <button id="convertAll" class="primary">⬇️ Convert All (ZIP)</button>
+      </div>
+    </header>
+
+    <main class="container">
+      <section class="dropzone" id="dropzone">
+        <div class="dz-inner">
+          <div class="dz-icon">📁</div>
+          <p>Drag & drop images here, or</p>
+          <div class="dz-buttons">
+            <input type="file" id="fileInput" multiple accept="image/*" hidden />
+            <button id="pickFiles">Choose Images</button>
+            <input type="file" id="logoInput" accept="image/*" hidden />
+            <button id="pickLogo" class="accent">Upload Logo</button>
+          </div>
+          <p class="hint">Supported: PNG, JPG, WebP, AVIF*, GIF, BMP, SVG*, TIFF* <span class="muted">(* rasterized)</span></p>
+        </div>
+      </section>
+
+      <section class="grid">
+        <div class="card">
+          <h2>Output Settings</h2>
+          <div class="grid2">
+            <label>Format
+              <select id="format">
+                <option value="image/webp">WebP</option>
+                <option value="image/png">PNG</option>
+                <option value="image/jpeg">JPEG</option>
+                <option value="image/avif">AVIF</option>
+              </select>
+            </label>
+            <label>Quality <span id="qLabel">(92%)</span>
+              <input type="range" id="quality" min="0.1" max="1" step="0.01" value="0.92" />
+              <small>Lossy formats only.</small>
+            </label>
+            <label>Resize
+              <select id="resizeMode">
+                <option value="original">Keep original</option>
+                <option value="pixels">Set width × height (px)</option>
+                <option value="percent">Scale by percentage</option>
+              </select>
+            </label>
+            <div id="pxBox" class="grid2 hidden">
+              <label>Width (px)<input type="number" id="pxW" min="1" value="0" /></label>
+              <label>Height (px)<input type="number" id="pxH" min="1" value="0" /></label>
+              <label class="row"><input type="checkbox" id="keepAspect" checked /> Keep aspect ratio</label>
+            </div>
+            <div id="pctBox" class="hidden">
+              <label>Scale (%)<input type="number" id="pct" min="1" max="1000" value="100" /></label>
+            </div>
+            <label>Background (for JPEG / opaque)
+              <input type="color" id="bgColor" value="#000000" />
+              <small>Used when output has no alpha</small>
+            </label>
+            <div class="grid3">
+              <label>Rotate (°)<input type="number" id="rotate" value="0" /></label>
+              <label class="row"><input type="checkbox" id="flipH" /> Flip H</label>
+              <label class="row"><input type="checkbox" id="flipV" /> Flip V</label>
+            </div>
+          </div>
+
+          <hr />
+          <div class="row">
+            <label class="row"><input type="checkbox" id="cropEnable" /> Enable crop</label>
+            <select id="cropAspect">
+              <option value="free">Free</option>
+              <option value="1:1">1:1</option>
+              <option value="4:3">4:3</option>
+              <option value="16:9">16:9</option>
+              <option value="9:16">9:16</option>
+            </select>
+            <select id="preset">
+              <option value="">Social presets…</option>
+              <option value="1">Instagram — Post 1:1</option>
+              <option value="0.8">Instagram — Portrait 4:5</option>
+              <option value="0.5625">Instagram — Story/Reel 9:16</option>
+              <option value="1.914">LinkedIn — Post 1200×627</option>
+              <option value="1">LinkedIn — Square 1:1</option>
+              <option value="0.4615">iPhone 13 wallpaper 1170×2532</option>
+            </select>
+            <button id="openCrop" class="accent">Open manual crop editor…</button>
+          </div>
+          <div id="focalRow" class="grid2 hidden">
+            <label>Focal X (%)<input type="range" id="focalX" min="0" max="100" value="50" /></label>
+            <label>Focal Y (%)<input type="range" id="focalY" min="0" max="100" value="50" /></label>
+          </div>
+
+          <hr />
+          <h3>Watermark</h3>
+          <div class="grid2">
+            <label>Text<input type="text" id="wmText" placeholder="© Your Brand" /></label>
+            <label>Opacity <span id="wmOL">(25%)</span><input type="range" id="wmOpacity" min="0" max="1" step="0.01" value="0.25" /></label>
+            <label>Font size<input type="number" id="wmSize" min="6" max="200" value="24" /></label>
+            <label>Position
+              <select id="wmPos">
+                <option value="bottom-right">Bottom right</option>
+                <option value="bottom-left">Bottom left</option>
+                <option value="top-right">Top right</option>
+                <option value="top-left">Top left</option>
+                <option value="center">Center</option>
+              </select>
+            </label>
+            <label>Margin (px)<input type="number" id="wmMargin" min="0" max="200" value="16" /></label>
+          </div>
+
+          <div class="grid2">
+            <label>Logo opacity <span id="logoOL">(50%)</span><input type="range" id="logoOpacity" min="0" max="1" step="0.01" value="0.5" /></label>
+            <label>Logo width (% of image)<input type="range" id="logoScale" min="4" max="40" step="1" value="12" /></label>
+            <label>Logo position
+              <select id="logoPos">
+                <option value="bottom-right">Bottom right</option>
+                <option value="bottom-left">Bottom left</option>
+                <option value="top-right">Top right</option>
+                <option value="top-left">Top left</option>
+                <option value="center">Center</option>
+              </select>
+            </label>
+            <label>Logo margin (px)<input type="number" id="logoMargin" min="0" max="200" value="16" /></label>
+          </div>
+
+          <hr />
+          <h3>Enhance</h3>
+          <div class="grid3">
+            <label class="row"><input type="checkbox" id="enhanceOn" /> Auto-enhance</label>
+            <label>Contrast ×<span id="cLabel">1.08</span><input type="range" id="contrast" min="0.5" max="2.5" step="0.01" value="1.08" /></label>
+            <label>Exposure (<span id="eLabel">0</span>)<input type="range" id="exposure" min="-50" max="50" step="1" value="0" /></label>
+            <label class="row"><input type="checkbox" id="sharpenOn" /> Sharpen</label>
+            <label>Sharpen amount<input type="range" id="sharpenAmt" min="0" max="1" step="0.01" value="0.5" /></label>
+          </div>
+
+          <hr />
+          <label class="row"><input type="checkbox" id="metadata" checked /> Best-effort metadata passthrough for JPEG (EXIF)</label>
+
+          <div class="toolbar">
+            <button id="clearAll">🧹 Clear</button>
+          </div>
+          <p class="muted">Everything runs locally in your browser. Animated GIF/SVG are rasterized.</p>
+        </div>
+
+        <div class="card">
+          <h2>Queue (<span id="count">0</span>)</h2>
+          <ul id="queue" class="queue"></ul>
+        </div>
+      </section>
+    </main>
+
+    <!-- Manual Crop Modal -->
+    <div id="cropModal" class="modal hidden">
+      <div class="modal-dialog">
+        <div class="modal-head">
+          <h3>Manual Crop</h3>
+          <div class="modal-actions">
+            <button id="cropReset">Reset</button>
+            <button id="cropSave" class="primary">Save crop</button>
+            <button id="cropClose">Close</button>
+          </div>
+        </div>
+        <div class="modal-body">
+          <div class="crop-stage">
+            <img id="cropImage" alt="" />
+            <div id="cropBox" class="crop-box">
+              <div class="handle tl"></div>
+              <div class="handle tr"></div>
+              <div class="handle bl"></div>
+              <div class="handle br"></div>
+            </div>
+          </div>
+          <div class="crop-controls">
+            <label>Zoom<input type="range" id="cropZoom" min="1" max="5" step="0.01" value="1" /></label>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <footer class="footer">Built for you — modern, fast, and private (everything stays on-device).</footer>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
